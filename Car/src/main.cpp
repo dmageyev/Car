@@ -629,7 +629,7 @@ void updateHorn() {
 
 // ======================= INPUT HANDLING =======================
 // Bluetooth line parser (input-only)
-void ;handleBluetoothInput() {
+void handleBluetoothInput() {
   while (BTSerial.available() > 0) {
     char c = (char)BTSerial.read();
     if (c == '\r') continue;
