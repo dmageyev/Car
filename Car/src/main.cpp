@@ -198,6 +198,13 @@ const uint16_t HORN_NOTES[]     = { 523, 392, 330, 262, 392, 523 };
 const uint16_t HORN_DURATIONS[] = { 160, 160, 200, 260, 180, 300 };
 const size_t HORN_LENGTH = sizeof(HORN_NOTES) / sizeof(HORN_NOTES[0]);
 
+// Windows startup melody (MS Windows XP startup sound approximation)
+//const uint16_t WIN_STARTUP_NOTES[]     = { 1245, 622, 932, 880, 622, 1245, 932 }; // B4, D5, F#5, G#5
+const uint16_t WIN_STARTUP_NOTES[]     = { 622, 311, 466, 440, 311, 622, 466 };
+//const uint16_t WIN_STARTUP_DURATIONS[] = { 333, 167, 500, 333, 333, 333, 1000 };
+const uint16_t WIN_STARTUP_DURATIONS[] = { 250, 125, 375, 250, 250, 250, 750 };
+const size_t WIN_STARTUP_LENGTH = sizeof(WIN_STARTUP_NOTES) / sizeof(WIN_STARTUP_NOTES[0]);
+
 // Command buffers
 constexpr size_t CMD_BUF_SIZE = 120;
 char btCmdBuf[CMD_BUF_SIZE]; size_t btCmdPos = 0;
@@ -287,6 +294,7 @@ void blinkLED(const LED &l, int times, int delayMs);
 void dbgPrint(const char *label, const String &value);
 void printStatus();
 void printStartupHelp();
+void playWindowsStartup();
 
 // ======================= EEPROM =======================
 void loadCalibrationFromEEPROM() {
@@ -350,6 +358,9 @@ void setup() {
 
   BTSerial.begin(9600); // input-only; no BT outputs
   if (DEBUG) Serial.println(F("Bluetooth ready (9600)"));
+
+  // Play Windows startup melody
+  playWindowsStartup();
 
   blinkLED(ledStatus, 3, 200);
   if (DEBUG) Serial.println(F("System Ready!"));
@@ -618,7 +629,7 @@ void updateHorn() {
 
 // ======================= INPUT HANDLING =======================
 // Bluetooth line parser (input-only)
-void handleBluetoothInput() {
+void ;handleBluetoothInput() {
   while (BTSerial.available() > 0) {
     char c = (char)BTSerial.read();
     if (c == '\r') continue;
@@ -1035,6 +1046,16 @@ void printStartupHelp() {
   Serial.println(F("  HELP or ?            - print this help"));
   Serial.println(F("=============================="));
   Serial.println(F(""));
+}
+
+void playWindowsStartup() {
+  // Play Windows XP-style startup sound (blocking)
+  for (size_t i = 0; i < WIN_STARTUP_LENGTH; i++) {
+    tone(BUZZER_PIN, WIN_STARTUP_NOTES[i], WIN_STARTUP_DURATIONS[i]);
+    delay(WIN_STARTUP_DURATIONS[i] ); // small gap between notes
+  }
+  noTone(BUZZER_PIN);
+  delay(100); // brief pause after melody
 }
 
 // ======================= MAIN LOOP =======================
