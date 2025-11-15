@@ -1,103 +1,182 @@
 /*
- * Arduino Project Template
- * 
- * Project: Car Robot
- * Author: Dmytro Ageyev
- * Date: November 2, 2025
- * Description: Template for Arduino-based car robot project
+ * Arduino Car Robot - Interactive Calibration + EEPROM + Friendly UI
+ * Author: Dmytro Ageyev (updated by copilot)
+ * Date: 2025-11-12
+ *
+ * - Input accepted from Bluetooth (BTSerial) and Serial.
+ * - Output ONLY to Serial (Serial Monitor).
+ * - Interactive calibration flow (CAL START / CAL_RUN / measurements / CAL SAVE).
+ * - EEPROM persistence for calibration.
+ * - Removed ultrasonic support; manual measurement used.
+ * - Added startup instructions (friendly interface).
+ * - Added command to restore factory calibration: "RESET CAL" (also "RESET_CAL").
+ *
+ * Summary of new user flows:
+ * - On power-up the device prints a brief help / command summary to Serial.
+ * - Use Serial or Bluetooth to send commands (Bluetooth receives but does not send).
+ * - For auto-calibration: on Serial run "CAL START F <ms>" then trigger runs via BT (CAL_RUN BOTH/L/R),
+ *   measure distance externally and type measurements into Serial when prompted, then "CAL SAVE".
+ * - To restore factory defaults: type "RESET CAL" on Serial (or send that line via BT) — this sets
+ *   coefficients to built-in defaults and saves them to EEPROM.
+ *
+ * Note: This file is an updated single-file example. For larger projects split into .h/.cpp modules.
  */
 
 #include <Arduino.h>
 #include <SoftwareSerial.h>
+#include <EEPROM.h>
 
-// ============================================
-// PIN DEFINITIONS
-// ============================================
+// ======================= CONFIG =======================
+constexpr bool DEBUG = true;
 
+// Motor Driver Pins
+constexpr uint8_t MOTOR_LEFT_PWM   = 10;
+constexpr uint8_t MOTOR_LEFT_DIR1  = 8;
+constexpr uint8_t MOTOR_LEFT_DIR2  = 9;
 
-// Motor Driver Pins (Example: L298P or similar)
-#define MOTOR_LEFT_PWM    10    // PWM pin for left motor speed control
-#define MOTOR_LEFT_DIR1   8    // Direction pin 1 for left motor
-#define MOTOR_LEFT_DIR2   9    // Direction pin 2 for left motor
+constexpr uint8_t MOTOR_RIGHT_PWM  = 5;
+constexpr uint8_t MOTOR_RIGHT_DIR1 = 7;
+constexpr uint8_t MOTOR_RIGHT_DIR2 = 6;
 
-#define MOTOR_RIGHT_PWM  5    // PWM pin for right motor speed control
-#define MOTOR_RIGHT_DIR1  7   // Direction pin 1 for right motor
-#define MOTOR_RIGHT_DIR2  6   // Direction pin 2 for right motor
-// Sensor Pins
+// LED / Output pins
+constexpr uint8_t LED_STATUS        = LED_BUILTIN;
+constexpr uint8_t LED_HEADLIGHTS    = 13;
+constexpr uint8_t LED_PARKING_FRONT = A1;
+constexpr uint8_t LED_PARKING_REAR  = 11; // PWM
+constexpr uint8_t LED_TURN_LEFT     = A2;
+constexpr uint8_t LED_TURN_RIGHT    = A3;
+constexpr uint8_t LED_REVERSE       = A5;
 
-// Ultrasonic Sensor Pins (Example: HC-SR04)
-#ifdef ULTRASONIC_SENSOR_ENABLED
-#define ULTRASONIC_TRIG   12   // Ultrasonic sensor trigger pin
-#define ULTRASONIC_ECHO   13   // Ultrasonic sensor echo pin
-#endif
+constexpr uint8_t BUZZER_PIN       = 4;
 
-// IR Sensor Pins (digital sensors)
-#ifdef IR_SENSOR_ENABLED
-// Toggle central IR sensor: 1 = enabled, 0 = disabled
-#ifndef IR_SENSOR_CENTER_ENABLED
-#define IR_SENSOR_CENTER_ENABLED 0
-#endif
+// Bluetooth pins (input-only)
+constexpr uint8_t BT_RX_PIN = 2;
+constexpr uint8_t BT_TX_PIN = 3;
+SoftwareSerial BTSerial(BT_RX_PIN, BT_TX_PIN);
 
-#define IR_SENSOR_LEFT     A4   // Left IR sensor (digital)
-#if IR_SENSOR_CENTER_ENABLED
-#define IR_SENSOR_CENTER   12   // Central IR sensor (digital)
-#endif
-#define IR_SENSOR_RIGHT    A0   // Right IR sensor moved to A4 to free D4 for buzzer
-#endif
+// ======================= CALIBRATION DEFAULTS & EEPROM =======================
+constexpr float CAL_LEFT_FORWARD   = 1.00f;
+constexpr float CAL_LEFT_BACKWARD  = 1.00f;
+constexpr float CAL_RIGHT_FORWARD  = 1.00f;
+constexpr float CAL_RIGHT_BACKWARD = 1.00f;
 
-// LED Indicators
-#define LED_STATUS        LED_BUILTIN  // Built-in LED for status indication
-#define LED_HEADLIGHTS    13           // Headlights (shared with built-in LED)
-#define LED_PARKING_FRONT A1           // Front parking lights
-#define LED_PARKING_REAR  11           // Rear parking lights + brake light (PWM)
-#define LED_TURN_LEFT     A2           // Left turn signal
-#define LED_TURN_RIGHT    A3           // Right turn signal
-#define LED_REVERSE       A5           // Reverse indicator (note: A7 is analog-only on classic Nano)
+struct CalData {
+  uint32_t magic;
+  float lf;
+  float lb;
+  float rf;
+  float rb;
+};
+constexpr uint32_t CAL_MAGIC = 0xCA11C0DE;
+constexpr int EEPROM_ADDR = 0;
 
+// ======================= CONSTANTS =======================
+constexpr int MOTOR_SPEED_MAX = 255;
+constexpr int MOTOR_SPEED_MIN = 0;
+constexpr int MOTOR_SPEED_DEFAULT = 150;
 
-// Additional Pins (customize as needed)
+constexpr unsigned long LOOP_DELAY = 10UL;             // ms
+constexpr unsigned long SENSOR_READ_INTERVAL = 100UL;  // ms
+constexpr unsigned long BRAKE_LIGHT_DURATION = 1000UL; // ms
+constexpr unsigned long TURN_BLINK_INTERVAL = 500UL;   // ms
+constexpr unsigned long ALARM_BLINK_INTERVAL = 350UL;  // ms
+constexpr unsigned long ALARM_BEEP_INTERVAL = 700UL;   // ms
 
-// Bluetooth (HC-05/HC-06) pins
-#define BT_RX_PIN          2    // Arduino RX (to BT TX)
-#define BT_TX_PIN          3    // Arduino TX (to BT RX)
+constexpr uint8_t LOW_PARKING = 32; // PWM low brightness
 
-// Buzzer pin for horn/alarm
-#define BUZZER_PIN         4    // Buzzer (horn + alarm) on digital pin D4
-// Horn (melody) state
-bool hornPlaying = false;
-size_t hornIndex = 0;
-unsigned long hornNoteStartMillis = 0;
+// ======================= TYPES =======================
+struct Motor {
+  uint8_t pwm;
+  uint8_t dir1;
+  uint8_t dir2;
+  float forwardCoef;
+  float backwardCoef;
 
-// ============================================
-// CONSTANTS
-// ============================================
+  Motor(uint8_t pwmPin, uint8_t dirPin1, uint8_t dirPin2, float fCoef = 1.0f, float bCoef = 1.0f)
+    : pwm(pwmPin), dir1(dirPin1), dir2(dirPin2), forwardCoef(fCoef), backwardCoef(bCoef) {}
 
-// Motor Speed Constants
-#define MOTOR_SPEED_MAX   255  // Maximum PWM value
-#define MOTOR_SPEED_MIN   0    // Minimum PWM value
-#define MOTOR_SPEED_DEFAULT 150 // Default driving speed
+  void begin() {
+    pinMode(pwm, OUTPUT);
+    pinMode(dir1, OUTPUT);
+    pinMode(dir2, OUTPUT);
+    stopRaw();
+  }
 
-// Sensor Thresholds
-#define DISTANCE_THRESHOLD 20  // Distance threshold in cm for obstacle detection
+  void stopRaw() {
+    digitalWrite(dir1, LOW);
+    digitalWrite(dir2, LOW);
+    analogWrite(pwm, 0);
+  }
 
-// Timing Constants
-#define LOOP_DELAY        10   // Main loop delay in milliseconds
-#define SENSOR_READ_INTERVAL 100 // Sensor reading interval in ms
-#define BRAKE_LIGHT_DURATION 1000 // Brake light duration in ms
-#define TURN_BLINK_INTERVAL 500   // Turn/hazard blink interval in ms
-#define ALARM_BLINK_INTERVAL 350  // Alarm blink interval for LEDs
-#define ALARM_BEEP_INTERVAL 700   // Alarm beep interval for buzzer
+  void stop() { stopRaw(); }
 
-#define LOW_PARKING 32 // Low brightness for parking lights (approx 12.5% of 255)
+  void setCalibration(float fCoef, float bCoef) {
+    if (fCoef <= 0.0f) fCoef = 1.0f;
+    if (bCoef <= 0.0f) bCoef = 1.0f;
+    forwardCoef = fCoef;
+    backwardCoef = bCoef;
+  }
 
-// ============================================
-// GLOBAL VARIABLES
-// ============================================
+  void setSpeed(int speed) {
+    if (speed >= 0) {
+      float scaled = speed * forwardCoef;
+      int s = constrain((int)roundf(scaled), 0, MOTOR_SPEED_MAX);
+      digitalWrite(dir1, HIGH);
+      digitalWrite(dir2, LOW);
+      analogWrite(pwm, s);
+    } else {
+      float scaled = (-speed) * backwardCoef;
+      int s = constrain((int)roundf(scaled), 0, MOTOR_SPEED_MAX);
+      digitalWrite(dir1, LOW);
+      digitalWrite(dir2, HIGH);
+      analogWrite(pwm, s);
+    }
+  }
 
-unsigned long previousMillis = 0;
+  // Raw speed bypass calibration - used for measurement runs
+  void setSpeedRaw(int speed) {
+    if (speed >= 0) {
+      int s = constrain(speed, 0, MOTOR_SPEED_MAX);
+      digitalWrite(dir1, HIGH);
+      digitalWrite(dir2, LOW);
+      analogWrite(pwm, s);
+    } else {
+      int s = constrain(-speed, 0, MOTOR_SPEED_MAX);
+      digitalWrite(dir1, LOW);
+      digitalWrite(dir2, HIGH);
+      analogWrite(pwm, s);
+    }
+  }
+};
+
+struct LED {
+  uint8_t pin;
+  bool isPwm;
+  void begin() const { pinMode(pin, OUTPUT); if (isPwm) analogWrite(pin, 0); else digitalWrite(pin, LOW); }
+  void set(bool on) const { if (isPwm) analogWrite(pin, on ? 255 : 0); else digitalWrite(pin, on ? HIGH : LOW); }
+  void writePWM(uint8_t v) const { if (isPwm) analogWrite(pin,v); else digitalWrite(pin, v?HIGH:LOW); }
+};
+Motor motorLeft(MOTOR_LEFT_PWM, MOTOR_LEFT_DIR1, MOTOR_LEFT_DIR2);
+Motor motorRight(MOTOR_RIGHT_PWM, MOTOR_RIGHT_DIR1, MOTOR_RIGHT_DIR2);
+// Motor motorLeft  = { MOTOR_LEFT_PWM, MOTOR_LEFT_DIR1, MOTOR_LEFT_DIR2, 1.0f, 1.0f};
+// Motor motorRight = { MOTOR_RIGHT_PWM, MOTOR_RIGHT_DIR1, MOTOR_RIGHT_DIR2, 1.0f, 1.0f };
+
+const LED ledStatus        = { LED_STATUS, false };
+const LED ledHeadlights    = { LED_HEADLIGHTS, false };
+const LED ledParkingFront  = { LED_PARKING_FRONT, false };
+const LED ledParkingRear   = { LED_PARKING_REAR, true  };
+const LED ledTurnLeft      = { LED_TURN_LEFT, false };
+const LED ledTurnRight     = { LED_TURN_RIGHT, false };
+const LED ledReverse       = { LED_REVERSE, false };
+const LED buzzerOut        = { BUZZER_PIN, false  };
+
+// State
+unsigned long previousSensorMillis = 0;
 unsigned long brakeStartMillis = 0;
 unsigned long lastTurnBlinkMillis = 0;
 unsigned long lastAlarmMillis = 0;
+unsigned long lastAlarmBeepMillis = 0;
+
 int currentSpeed = MOTOR_SPEED_DEFAULT;
 bool systemEnabled = false;
 bool headlightsOn = false;
@@ -110,194 +189,218 @@ bool leftTurnActive = false;
 bool rightTurnActive = false;
 bool turnBlinkState = false;
 bool alarmOn = false;
-SoftwareSerial BTSerial(BT_RX_PIN, BT_TX_PIN);
 
-void setReverseIndicator(bool state);
-// ============================================
-// FUNCTION DECLARATIONS
-// ============================================
+// Horn
+bool hornPlaying = false;
+size_t hornIndex = 0;
+unsigned long hornNoteStartMillis = 0;
+const uint16_t HORN_NOTES[]     = { 523, 392, 330, 262, 392, 523 };
+const uint16_t HORN_DURATIONS[] = { 160, 160, 200, 260, 180, 300 };
+const size_t HORN_LENGTH = sizeof(HORN_NOTES) / sizeof(HORN_NOTES[0]);
 
+// Windows startup melody (MS Windows XP startup sound approximation)
+//const uint16_t WIN_STARTUP_NOTES[]     = { 1245, 622, 932, 880, 622, 1245, 932 }; // B4, D5, F#5, G#5
+const uint16_t WIN_STARTUP_NOTES[]     = { 622, 311, 466, 440, 311, 622, 466 };
+//const uint16_t WIN_STARTUP_DURATIONS[] = { 333, 167, 500, 333, 333, 333, 1000 };
+const uint16_t WIN_STARTUP_DURATIONS[] = { 250, 125, 375, 250, 250, 250, 750 };
+const size_t WIN_STARTUP_LENGTH = sizeof(WIN_STARTUP_NOTES) / sizeof(WIN_STARTUP_NOTES[0]);
+
+// Command buffers
+constexpr size_t CMD_BUF_SIZE = 120;
+char btCmdBuf[CMD_BUF_SIZE]; size_t btCmdPos = 0;
+char serCmdBuf[CMD_BUF_SIZE]; size_t serCmdPos = 0;
+
+// ======================= CALIBRATION INTERACTIVE STATE =======================
+enum CalDir { CAL_FORWARD, CAL_BACKWARD };
+enum CalPhase {
+  CAL_IDLE,
+  CAL_WAIT_BOTH_RUN,
+  CAL_WAIT_BOTH_MEASURE,
+  CAL_WAIT_LEFT_RUN,
+  CAL_WAIT_LEFT_MEASURE,
+  CAL_WAIT_RIGHT_RUN,
+  CAL_WAIT_RIGHT_MEASURE,
+  CAL_APPLIED // applied in RAM, awaiting SAVE or CANCEL
+};
+
+CalPhase calPhase = CAL_IDLE;
+CalDir calDir = CAL_FORWARD;
+unsigned long calDurationMs = 0;
+int calTestSpeed = 120; // default raw speed used for calibration runs
+float measuredBoth = 0.0f;   // cm input by user
+float measuredLeft = 0.0f;   // cm
+float measuredRight = 0.0f;  // cm
+
+// backup coefficients (if user cancels)
+struct CalBackup { float lf, lb, rf, rb; } calBackup;
+
+// ======================= DECLARATIONS =======================
 void setupPins();
 void initializeSystem();
 
-// Motor Control Functions
-void motorStop();
-void motorForward(int speed);
-void motorBackward(int speed);
-void motorTurnLeft(int speed);
-void motorTurnRight(int speed);
-void setMotorSpeed(int leftSpeed, int rightSpeed);
+// Motor helpers
+void setBothMotors(int speed);
+void stopMotors();
+void forward(int speed);
+void backward(int speed);
+void turnLeft(int speed);
+void turnRight(int speed);
+void forwardLeft(int speed);
+void forwardRight(int speed);
+void backwardLeft(int speed);
+void backwardRight(int speed);
 
-// Diagonal movement functions
-void motorForwardLeft(int speed);
-void motorForwardRight(int speed);
-void motorBackwardLeft(int speed);
-void motorBackwardRight(int speed);
+// Motors raw run helper
+void runMotorsRaw(int leftRaw, int rightRaw, unsigned long durationMs);
 
-// Sensor Functions
-float readUltrasonicDistance();
-int readIRSensor(int sensorPin);
-void handleBluetoothInput();
-void processBTCommand(char c);
-
-// Utility Functions
-void blinkLED(int pin, int times, int delayMs);
+// Lighting / indicators
+void setReverseIndicator(bool state);
+void activateBrakeLight();
+void updateBrakeLight();
 void setHeadlights(bool state);
 void setParkingLights(bool state);
 void setParkingMode(bool state);
-void activateBrakeLight();
-void updateBrakeLight();
-void setHazard(bool state);
-void updateTurnSignals();
 void setLeftTurn(bool state);
 void setRightTurn(bool state);
+void setHazard(bool state);
+void updateTurnSignals();
+
+// Alarm / horn
 void setAlarm(bool state);
+void updateAlarm();
 void startHorn();
 void updateHorn();
-void updateAlarm();
 
-// ============================================
-// SETUP FUNCTION
-// ============================================
+// Commands
+void handleBluetoothInput();
+void handleSerialInput();
+void processCommandLine(const char *line);
+void processSingleCharCommand(char c);
 
+// EEPROM calibration
+void loadCalibrationFromEEPROM();
+void saveCalibrationToEEPROM();
+void resetCalibrationToFactory();
+
+// Calibration flow helpers
+void calStart(CalDir dir, unsigned long durationMs);
+void calAbort();
+void calApplyAndCompute();
+void calSave();
+void calCancel();
+
+// Utility
+void blinkLED(const LED &l, int times, int delayMs);
+void dbgPrint(const char *label, const String &value);
+void printStatus();
+void printStartupHelp();
+void playWindowsStartup();
+
+// ======================= EEPROM =======================
+void loadCalibrationFromEEPROM() {
+  CalData data;
+  EEPROM.get(EEPROM_ADDR, data);
+  if (data.magic == CAL_MAGIC) {
+    motorLeft.setCalibration(data.lf, data.lb);
+    motorRight.setCalibration(data.rf, data.rb);
+    if (DEBUG) {
+      Serial.println(F("Calibration loaded from EEPROM:"));
+      Serial.print(F("  LF=")); Serial.println(data.lf);
+      Serial.print(F("  LB=")); Serial.println(data.lb);
+      Serial.print(F("  RF=")); Serial.println(data.rf);
+      Serial.print(F("  RB=")); Serial.println(data.rb);
+    }
+  } else {
+    motorLeft.setCalibration(CAL_LEFT_FORWARD, CAL_LEFT_BACKWARD);
+    motorRight.setCalibration(CAL_RIGHT_FORWARD, CAL_RIGHT_BACKWARD);
+    saveCalibrationToEEPROM();
+    if (DEBUG) Serial.println(F("No EEPROM calibration found; using defaults and saving."));
+  }
+}
+
+void saveCalibrationToEEPROM() {
+  CalData data;
+  data.magic = CAL_MAGIC;
+  data.lf = motorLeft.forwardCoef;
+  data.lb = motorLeft.backwardCoef;
+  data.rf = motorRight.forwardCoef;
+  data.rb = motorRight.backwardCoef;
+  EEPROM.put(EEPROM_ADDR, data);
+  if (DEBUG) {
+    Serial.println(F("Calibration saved to EEPROM:"));
+    Serial.print(F("  LF=")); Serial.println(data.lf);
+    Serial.print(F("  LB=")); Serial.println(data.lb);
+    Serial.print(F("  RF=")); Serial.println(data.rf);
+    Serial.print(F("  RB=")); Serial.println(data.rb);
+  }
+}
+
+void resetCalibrationToFactory() {
+  motorLeft.setCalibration(CAL_LEFT_FORWARD, CAL_LEFT_BACKWARD);
+  motorRight.setCalibration(CAL_RIGHT_FORWARD, CAL_RIGHT_BACKWARD);
+  saveCalibrationToEEPROM();
+  Serial.println(F("Factory calibration restored and saved to EEPROM."));
+}
+
+// ======================= SETUP =======================
 void setup() {
-  // Initialize serial communication for debugging
   Serial.begin(9600);
-  Serial.println("=================================");
-  Serial.println("Arduino Car Robot - Initializing");
-  Serial.println("=================================");
-  
-  // Configure pins
+  if (DEBUG) {
+    Serial.println(F("================================="));
+    Serial.println(F("Arduino Car Robot - Initializing"));
+    Serial.println(F("================================="));
+  }
+
   setupPins();
-  
-  // Initialize system
   initializeSystem();
 
-  // Initialize Bluetooth
-  BTSerial.begin(9600);
-  Serial.println("Bluetooth ready (9600)");
-  
-  // System ready indication
-  blinkLED(LED_STATUS, 3, 300);
-  Serial.println("System Ready!");
+  loadCalibrationFromEEPROM();
+
+  BTSerial.begin(9600); // input-only; no BT outputs
+  if (DEBUG) Serial.println(F("Bluetooth ready (9600)"));
+
+  // Play Windows startup melody
+  playWindowsStartup();
+
+  blinkLED(ledStatus, 3, 200);
+  if (DEBUG) Serial.println(F("System Ready!"));
+
+  // Friendly startup instructions printed only to Serial
+  printStartupHelp();
 }
 
-/**
- * Reverse indicator control
- */
-void setReverseIndicator(bool state) {
-  reverseActive = state;
-  digitalWrite(LED_REVERSE, state ? HIGH : LOW);
-}
-// ============================================
-// MAIN LOOP FUNCTION
-// ============================================
-
-void loop() {
-  unsigned long currentMillis = millis();
-  
-  // Main program logic goes here
-  
-  // Example: Read sensors periodically
-    if (currentMillis - previousMillis >= SENSOR_READ_INTERVAL) {
-      previousMillis = currentMillis;
-      
-  #ifdef ULTRASONIC_SENSOR_ENABLED
-      // Read distance sensor
-      float distance = readUltrasonicDistance();
-      Serial.print("Distance: ");
-      Serial.print(distance);
-      Serial.println(" cm");
-  #endif
-      
-  #ifdef IR_SENSOR_ENABLED
-      // Read IR sensors (digital 0/1)
-      int irLeft = readIRSensor(IR_SENSOR_LEFT);
-      int irRight = readIRSensor(IR_SENSOR_RIGHT);
-      Serial.print("IR Left: ");
-      Serial.print(irLeft);
-      Serial.print(" | IR Right: ");
-      Serial.println(irRight);
-  #endif
-    }
-  
-  // Bluetooth command handling
-  handleBluetoothInput();
-  
-  // Update timers/state machines
-  updateBrakeLight();
-  updateTurnSignals();
-  updateAlarm();
-  updateHorn();
-  
-  // Add your main control logic here
-  
-  delay(LOOP_DELAY);
-}
-
-// ============================================
-// FUNCTION IMPLEMENTATIONS
-// ============================================
-
-/**
- * Configure all pins as INPUT or OUTPUT
- */
 void setupPins() {
-  // Motor pins
-  pinMode(MOTOR_LEFT_PWM, OUTPUT);
-  pinMode(MOTOR_LEFT_DIR1, OUTPUT);
-  pinMode(MOTOR_LEFT_DIR2, OUTPUT);
-  pinMode(MOTOR_RIGHT_PWM, OUTPUT);
-  pinMode(MOTOR_RIGHT_DIR1, OUTPUT);
-  pinMode(MOTOR_RIGHT_DIR2, OUTPUT);
-  
-  // Sensor pins
-#ifdef ULTRASONIC_SENSOR_ENABLED
-  pinMode(ULTRASONIC_TRIG, OUTPUT);
-  pinMode(ULTRASONIC_ECHO, INPUT);
-#endif
+  motorLeft.begin();
+  motorRight.begin();
 
-#ifdef IR_SENSOR_ENABLED
-  pinMode(IR_SENSOR_LEFT, INPUT);
-  #if IR_SENSOR_CENTER_ENABLED
-  pinMode(IR_SENSOR_CENTER, INPUT);
-  #endif
-  pinMode(IR_SENSOR_RIGHT, INPUT);
-#endif
-  
-  // LED pins
-  pinMode(LED_STATUS, OUTPUT);
-  pinMode(LED_HEADLIGHTS, OUTPUT);
-  pinMode(LED_PARKING_FRONT, OUTPUT);
-  pinMode(LED_PARKING_REAR, OUTPUT);
-  pinMode(LED_TURN_LEFT, OUTPUT);
-  pinMode(LED_TURN_RIGHT, OUTPUT);
-  pinMode(LED_REVERSE, OUTPUT);
+  // LEDs / Outputs
+  ledStatus.begin();
+  ledHeadlights.begin();
+  ledParkingFront.begin();
+  ledParkingRear.begin();
+  ledTurnLeft.begin();
+  ledTurnRight.begin();
+  ledReverse.begin();
   pinMode(BUZZER_PIN, OUTPUT);
-  pinMode(LED_PARKING_FRONT, OUTPUT);
- 
-  
-  // Additional pins removed: buzzer and button support
-  
-  Serial.println("Pins configured successfully");
+
+  if (DEBUG) Serial.println(F("Pins configured successfully"));
 }
 
-/**
- * Initialize system components
- */
 void initializeSystem() {
-  // Stop all motors
-  motorStop();
-  
-  // Turn off all LEDs
-  digitalWrite(LED_STATUS, LOW);
-  digitalWrite(LED_HEADLIGHTS, LOW);
-  digitalWrite(LED_PARKING_FRONT, LOW);
-  analogWrite(LED_PARKING_REAR, 0);
-  digitalWrite(LED_TURN_LEFT, LOW);
-  digitalWrite(LED_TURN_RIGHT, LOW);
-  digitalWrite(LED_REVERSE, LOW);
-  digitalWrite(BUZZER_PIN, LOW);
+  stopMotors();
+
+  // Turn off LEDs
+  ledStatus.set(false);
+  ledHeadlights.set(false);
+  ledParkingFront.set(false);
+  ledParkingRear.writePWM(0);
+  ledTurnLeft.set(false);
+  ledTurnRight.set(false);
+  ledReverse.set(false);
+
+  buzzerOut.set(false);
+
+  // reset states
   headlightsOn = false;
   parkingLightsOn = false;
   parkingModeOn = false;
@@ -307,356 +410,154 @@ void initializeSystem() {
   rightTurnActive = false;
   turnBlinkState = false;
   alarmOn = false;
-  
-  // Initialize variables
+
   systemEnabled = true;
-  
-  Serial.println("System initialized");
+
+  if (DEBUG) Serial.println(F("System initialized"));
 }
 
-// ============================================
-// MOTOR CONTROL FUNCTIONS
-// ============================================
+// ======================= MOTOR CONTROL =======================
+void setBothMotors(int speed) {
+  motorLeft.setSpeed(speed);
+  motorRight.setSpeed(speed);
+}
 
-/**
- * Stop all motors
- */
-void motorStop() {
-  digitalWrite(MOTOR_LEFT_DIR1, LOW);
-  digitalWrite(MOTOR_LEFT_DIR2, LOW);
-  digitalWrite(MOTOR_RIGHT_DIR1, LOW);
-  digitalWrite(MOTOR_RIGHT_DIR2, LOW);
-  analogWrite(MOTOR_LEFT_PWM, 0);
-  analogWrite(MOTOR_RIGHT_PWM, 0);
-  
-  // Activate brake light for 1 second
+void stopMotors() {
+  motorLeft.stop();
+  motorRight.stop();
   activateBrakeLight();
 }
 
-/**
- * Move forward at specified speed
- */
-void motorForward(int speed) {
-  speed = constrain(speed, MOTOR_SPEED_MIN, MOTOR_SPEED_MAX);
-  digitalWrite(MOTOR_LEFT_DIR1, HIGH);
-  digitalWrite(MOTOR_LEFT_DIR2, LOW);
-  digitalWrite(MOTOR_RIGHT_DIR1, HIGH);
-  digitalWrite(MOTOR_RIGHT_DIR2, LOW);
-  analogWrite(MOTOR_LEFT_PWM, speed);
-  analogWrite(MOTOR_RIGHT_PWM, speed);
-  Serial.print("Motor Forward Speed: ");
-  Serial.println(speed);
+void forward(int speed) {
+  setBothMotors(constrain(speed, MOTOR_SPEED_MIN, MOTOR_SPEED_MAX));
+  setReverseIndicator(false);
 }
 
-/**
- * Move backward at specified speed
- */
-void motorBackward(int speed) {
-  speed = constrain(speed, MOTOR_SPEED_MIN, MOTOR_SPEED_MAX);
-  digitalWrite(MOTOR_LEFT_DIR1, LOW);
-  digitalWrite(MOTOR_LEFT_DIR2, HIGH);
-  digitalWrite(MOTOR_RIGHT_DIR1, LOW);
-  digitalWrite(MOTOR_RIGHT_DIR2, HIGH);
-  analogWrite(MOTOR_LEFT_PWM, speed);
-  analogWrite(MOTOR_RIGHT_PWM, speed);
-  Serial.print("Motor Backward Speed: ");
-  Serial.println(speed);
+void backward(int speed) {
+  setBothMotors(-constrain(speed, MOTOR_SPEED_MIN, MOTOR_SPEED_MAX));
+  setReverseIndicator(true);
 }
 
-/**
- * Turn left at specified speed
- */
-void motorTurnLeft(int speed) {
-  speed = constrain(speed, MOTOR_SPEED_MIN, MOTOR_SPEED_MAX);
-  digitalWrite(MOTOR_LEFT_DIR1, LOW);
-  digitalWrite(MOTOR_LEFT_DIR2, HIGH);
-  digitalWrite(MOTOR_RIGHT_DIR1, HIGH);
-  digitalWrite(MOTOR_RIGHT_DIR2, LOW);
-  analogWrite(MOTOR_LEFT_PWM, speed);
-  analogWrite(MOTOR_RIGHT_PWM, speed);
-  Serial.print("Motor Turn Left Speed: ");
-  Serial.println(speed);
-  setLeftTurn(true);
-  setRightTurn(false);
+void turnLeft(int speed) {
+  motorLeft.setSpeed(-constrain(speed, MOTOR_SPEED_MIN, MOTOR_SPEED_MAX));
+  motorRight.setSpeed(constrain(speed, MOTOR_SPEED_MIN, MOTOR_SPEED_MAX));
+  setLeftTurn(true); setRightTurn(false);
+  setReverseIndicator(false);
 }
 
-/**
- * Turn right at specified speed
- */
-void motorTurnRight(int speed) {
-  speed = constrain(speed, MOTOR_SPEED_MIN, MOTOR_SPEED_MAX);
-  digitalWrite(MOTOR_LEFT_DIR1, HIGH);
-  digitalWrite(MOTOR_LEFT_DIR2, LOW);
-  digitalWrite(MOTOR_RIGHT_DIR1, LOW);
-  digitalWrite(MOTOR_RIGHT_DIR2, HIGH);
-  analogWrite(MOTOR_LEFT_PWM, speed);
-  analogWrite(MOTOR_RIGHT_PWM, speed);
-  Serial.print("Motor Turn Right Speed: ");
-  Serial.println(speed);
-  setLeftTurn(false);
-  setRightTurn(true);
+void turnRight(int speed) {
+  motorLeft.setSpeed(constrain(speed, MOTOR_SPEED_MIN, MOTOR_SPEED_MAX));
+  motorRight.setSpeed(-constrain(speed, MOTOR_SPEED_MIN, MOTOR_SPEED_MAX));
+  setLeftTurn(false); setRightTurn(true);
+  setReverseIndicator(false);
 }
 
-/**
- * Set individual motor speeds (for advanced control)
- */
-void setMotorSpeed(int leftSpeed, int rightSpeed) {
-  leftSpeed = constrain(leftSpeed, -MOTOR_SPEED_MAX, MOTOR_SPEED_MAX);
-  rightSpeed = constrain(rightSpeed, -MOTOR_SPEED_MAX, MOTOR_SPEED_MAX);
-  
-  // Left motor
-  if (leftSpeed >= 0) {
-    digitalWrite(MOTOR_LEFT_DIR1, HIGH);
-    digitalWrite(MOTOR_LEFT_DIR2, LOW);
-    analogWrite(MOTOR_LEFT_PWM, leftSpeed);
-  } else {
-    digitalWrite(MOTOR_LEFT_DIR1, LOW);
-    digitalWrite(MOTOR_LEFT_DIR2, HIGH);
-    analogWrite(MOTOR_LEFT_PWM, -leftSpeed);
+void forwardLeft(int speed) {
+  motorLeft.setSpeed((int)roundf(speed * 0.6f));
+  motorRight.setSpeed(speed);
+  setLeftTurn(true); setRightTurn(false);
+  setReverseIndicator(false);
+}
+
+void forwardRight(int speed) {
+  motorLeft.setSpeed(speed);
+  motorRight.setSpeed((int)roundf(speed * 0.6f));
+  setLeftTurn(false); setRightTurn(true);
+  setReverseIndicator(false);
+}
+
+void backwardLeft(int speed) {
+  motorLeft.setSpeed(-(int)roundf(speed * 0.6f));
+  motorRight.setSpeed(-speed);
+  setLeftTurn(true); setRightTurn(false);
+  setReverseIndicator(true);
+}
+
+void backwardRight(int speed) {
+  motorLeft.setSpeed(-speed);
+  motorRight.setSpeed(-(int)roundf(speed * 0.6f));
+  setLeftTurn(false); setRightTurn(true);
+  setReverseIndicator(true);
+}
+
+// run motors raw for duration (blocking)
+void runMotorsRaw(int leftRaw, int rightRaw, unsigned long durationMs) {
+  motorLeft.setSpeedRaw(leftRaw);
+  motorRight.setSpeedRaw(rightRaw);
+  unsigned long start = millis();
+  while (millis() - start < durationMs) {
+    // allow USB/serial handling
+    delay(5);
   }
-  
-  // Right motor
-  if (rightSpeed >= 0) {
-    digitalWrite(MOTOR_RIGHT_DIR1, HIGH);
-    digitalWrite(MOTOR_RIGHT_DIR2, LOW);
-    analogWrite(MOTOR_RIGHT_PWM, rightSpeed);
-  } else {
-    digitalWrite(MOTOR_RIGHT_DIR1, LOW);
-    digitalWrite(MOTOR_RIGHT_DIR2, HIGH);
-    analogWrite(MOTOR_RIGHT_PWM, -rightSpeed);
+  motorLeft.stopRaw();
+  motorRight.stopRaw();
+}
+
+// ======================= LIGHTS / INDICATORS =======================
+void setReverseIndicator(bool state) {
+  reverseActive = state;
+  ledReverse.set(state);
+}
+
+void activateBrakeLight() {
+  if (parkingModeOn) return;
+  brakeActive = true;
+  brakeStartMillis = millis();
+  ledParkingRear.writePWM(255);
+}
+
+void updateBrakeLight() {
+  if (!brakeActive) return;
+  if (millis() - brakeStartMillis >= BRAKE_LIGHT_DURATION) {
+    brakeActive = false;
+    if (parkingModeOn) return;
+    if (parkingLightsOn) ledParkingRear.writePWM(LOW_PARKING);
+    else ledParkingRear.writePWM(0);
   }
 }
 
-/**
- * Move forward and left (diagonal) - left motor slower
- */
-void motorForwardLeft(int speed) {
-  speed = constrain(speed, MOTOR_SPEED_MIN, MOTOR_SPEED_MAX);
-  int reducedSpeed = speed * 0.6;  // 60% speed for left motor
-  digitalWrite(MOTOR_LEFT_DIR1, HIGH);
-  digitalWrite(MOTOR_LEFT_DIR2, LOW);
-  digitalWrite(MOTOR_RIGHT_DIR1, HIGH);
-  digitalWrite(MOTOR_RIGHT_DIR2, LOW);
-  analogWrite(MOTOR_LEFT_PWM, reducedSpeed);
-  analogWrite(MOTOR_RIGHT_PWM, speed);
-  Serial.print("Motor Forward-Left Speed: ");
-  Serial.println(speed);
-  setLeftTurn(true);
-  setRightTurn(false);
-}
-
-/**
- * Move forward and right (diagonal) - right motor slower
- */
-void motorForwardRight(int speed) {
-  speed = constrain(speed, MOTOR_SPEED_MIN, MOTOR_SPEED_MAX);
-  int reducedSpeed = speed * 0.6;  // 60% speed for right motor
-  digitalWrite(MOTOR_LEFT_DIR1, HIGH);
-  digitalWrite(MOTOR_LEFT_DIR2, LOW);
-  digitalWrite(MOTOR_RIGHT_DIR1, HIGH);
-  digitalWrite(MOTOR_RIGHT_DIR2, LOW);
-  analogWrite(MOTOR_LEFT_PWM, speed);
-  analogWrite(MOTOR_RIGHT_PWM, reducedSpeed);
-  Serial.print("Motor Forward-Right Speed: ");
-  Serial.println(speed);
-  setLeftTurn(false);
-  setRightTurn(true);
-}
-
-/**
- * Move backward and left (diagonal) - left motor slower
- */
-void motorBackwardLeft(int speed) {
-  speed = constrain(speed, MOTOR_SPEED_MIN, MOTOR_SPEED_MAX);
-  int reducedSpeed = speed * 0.6;  // 60% speed for left motor
-  digitalWrite(MOTOR_LEFT_DIR1, LOW);
-  digitalWrite(MOTOR_LEFT_DIR2, HIGH);
-  digitalWrite(MOTOR_RIGHT_DIR1, LOW);
-  digitalWrite(MOTOR_RIGHT_DIR2, HIGH);
-  analogWrite(MOTOR_LEFT_PWM, reducedSpeed);
-  analogWrite(MOTOR_RIGHT_PWM, speed);
-  Serial.print("Motor Backward-Left Speed: ");
-  Serial.println(speed);
-  setLeftTurn(true);
-  setRightTurn(false);
-}
-
-/**
- * Move backward and right (diagonal) - right motor slower
- */
-void motorBackwardRight(int speed) {
-  speed = constrain(speed, MOTOR_SPEED_MIN, MOTOR_SPEED_MAX);
-  int reducedSpeed = speed * 0.6;  // 60% speed for right motor
-  digitalWrite(MOTOR_LEFT_DIR1, LOW);
-  digitalWrite(MOTOR_LEFT_DIR2, HIGH);
-  digitalWrite(MOTOR_RIGHT_DIR1, LOW);
-  digitalWrite(MOTOR_RIGHT_DIR2, HIGH);
-  analogWrite(MOTOR_LEFT_PWM, speed);
-  analogWrite(MOTOR_RIGHT_PWM, reducedSpeed);
-  Serial.print("Motor Backward-Right Speed: ");
-  Serial.println(speed);
-  setLeftTurn(false);
-  setRightTurn(true);
-}
-
-// ============================================
-// SENSOR FUNCTIONS
-// ============================================
-
-/**
- * Read distance from ultrasonic sensor (HC-SR04)
- * Returns distance in centimeters
- */
-#ifdef ULTRASONIC_SENSOR_ENABLED
-float readUltrasonicDistance() {
-  // Send trigger pulse
-  digitalWrite(ULTRASONIC_TRIG, LOW);
-  delayMicroseconds(2);
-  digitalWrite(ULTRASONIC_TRIG, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(ULTRASONIC_TRIG, LOW);
-  
-  // Read echo pulse
-  long duration = pulseIn(ULTRASONIC_ECHO, HIGH, 30000); // 30ms timeout
-  
-  // Calculate distance (speed of sound = 343 m/s)
-  float distance = (duration * 0.0343) / 2.0;
-  
-  // Return 0 if no echo received
-  return (duration == 0) ? 0 : distance;
-}
-#else
-float readUltrasonicDistance() {
-  return 0;
-}
-#endif
-
-/**
- * Read IR sensor value
- * Returns digital value (0 or 1)
- */
-#ifdef IR_SENSOR_ENABLED
-int readIRSensor(int sensorPin) {
-  return digitalRead(sensorPin);
-}
-#else
-int readIRSensor(int sensorPin) {
-  return 0;
-}
-#endif
-
-// ============================================
-// UTILITY FUNCTIONS
-// ============================================
-
-/**
- * Blink LED for indication
- */
-void blinkLED(int pin, int times, int delayMs) {
-  for (int i = 0; i < times; i++) {
-    digitalWrite(pin, HIGH);
-    delay(delayMs);
-    digitalWrite(pin, LOW);
-    delay(delayMs);
-  }
-}
-
-/**
- * Set headlights on/off
- */
 void setHeadlights(bool state) {
   headlightsOn = state;
-  digitalWrite(LED_HEADLIGHTS, state ? HIGH : LOW);
-  BTSerial.print("Headlights: ");
-  BTSerial.println(state ? "ON" : "OFF");
-  Serial.print("Headlights: ");
-  Serial.println(state ? "ON" : "OFF");
+  ledHeadlights.set(state);
+  if (DEBUG) dbgPrint("Headlights", String(state ? "ON" : "OFF"));
 }
 
-/**
- * Set parking lights on/off
- */
 void setParkingLights(bool state) {
   parkingLightsOn = state;
-  digitalWrite(LED_PARKING_FRONT, state ? HIGH : LOW);
-  if (state) {
-    analogWrite(LED_PARKING_REAR, LOW_PARKING); // Low brightness
-  } else {
-    analogWrite(LED_PARKING_REAR, 0);
-  }
-  BTSerial.print("Parking lights: ");
-  BTSerial.println(state ? "ON" : "OFF");
-  Serial.print("Parking lights: ");
-  Serial.println(state ? "ON" : "OFF");
+  ledParkingFront.set(state);
+  if (state) ledParkingRear.writePWM(LOW_PARKING);
+  else if (!brakeActive) ledParkingRear.writePWM(0);
+  if (DEBUG) dbgPrint("Parking", String(state ? "ON" : "OFF"));
 }
 
-/**
- * Set parking mode on/off
- */
 void setParkingMode(bool state) {
   parkingModeOn = state;
   if (state) {
-    motorStop();
-    analogWrite(LED_PARKING_REAR, 255); // Full brightness (brake/parking light)
-    BTSerial.println("Parking mode: ON (motors locked)");
-    Serial.println("Parking mode: ON (motors locked)");
+    stopMotors();
+    ledParkingRear.writePWM(255);
+    if (DEBUG) Serial.println(F("Parking mode: ON (motors locked)"));
   } else {
-    // Return to parking lights state if they were on
-    if (parkingLightsOn) {
-      analogWrite(LED_PARKING_REAR, LOW_PARKING); // Low brightness
-    } else {
-      analogWrite(LED_PARKING_REAR, 0);
-    }
-    BTSerial.println("Parking mode: OFF");
-    Serial.println("Parking mode: OFF");
+    if (parkingLightsOn) ledParkingRear.writePWM(LOW_PARKING);
+    else ledParkingRear.writePWM(0);
+    if (DEBUG) Serial.println(F("Parking mode: OFF"));
   }
 }
 
-/**
- * Activate brake light for 1 second
- */
-void activateBrakeLight() {
-  if (!parkingModeOn) { // Don't override parking mode
-    brakeActive = true;
-    brakeStartMillis = millis();
-    analogWrite(LED_PARKING_REAR, 255); // Full brightness
-  }
-}
-
-/**
- * Update brake light timer (call in loop)
- */
-void updateBrakeLight() {
-  if (brakeActive && (millis() - brakeStartMillis >= BRAKE_LIGHT_DURATION)) {
-    brakeActive = false;
-    // Return to parking lights state if they were on
-    if (parkingLightsOn && !parkingModeOn) {
-      analogWrite(LED_PARKING_REAR, LOW_PARKING); // Low brightness
-    } else if (!parkingModeOn) {
-      analogWrite(LED_PARKING_REAR, 0);
-    }
-  }
-}
-
-/**
- * Turn signals and hazard handling
- */
 void setLeftTurn(bool state) {
   leftTurnActive = state;
-  if (!state) digitalWrite(LED_TURN_LEFT, LOW);
+  if (!state) ledTurnLeft.set(false);
 }
 
 void setRightTurn(bool state) {
   rightTurnActive = state;
-  if (!state) digitalWrite(LED_TURN_RIGHT, LOW);
+  if (!state) ledTurnRight.set(false);
 }
 
 void setHazard(bool state) {
   hazardOn = state;
   if (!state) {
-    // Turn off both when hazard stops; resume based on active sides
-    digitalWrite(LED_TURN_LEFT, LOW);
-    digitalWrite(LED_TURN_RIGHT, LOW);
+    ledTurnLeft.set(false);
+    ledTurnRight.set(false);
   }
 }
 
@@ -667,71 +568,44 @@ void updateTurnSignals() {
       lastTurnBlinkMillis = now;
       turnBlinkState = !turnBlinkState;
     }
-    // Hazard overrides individual
     if (hazardOn) {
-      digitalWrite(LED_TURN_LEFT, turnBlinkState ? HIGH : LOW);
-      digitalWrite(LED_TURN_RIGHT, turnBlinkState ? HIGH : LOW);
+      ledTurnLeft.set(turnBlinkState);
+      ledTurnRight.set(turnBlinkState);
     } else {
-      if (leftTurnActive) {
-        digitalWrite(LED_TURN_LEFT, turnBlinkState ? HIGH : LOW);
-      } else {
-        digitalWrite(LED_TURN_LEFT, LOW);
-      }
-      if (rightTurnActive) {
-        digitalWrite(LED_TURN_RIGHT, turnBlinkState ? HIGH : LOW);
-      } else {
-        digitalWrite(LED_TURN_RIGHT, LOW);
-      }
+      ledTurnLeft.set(leftTurnActive ? turnBlinkState : false);
+      ledTurnRight.set(rightTurnActive ? turnBlinkState : false);
     }
   } else {
-    // Ensure off when inactive
-    digitalWrite(LED_TURN_LEFT, LOW);
-    digitalWrite(LED_TURN_RIGHT, LOW);
+    ledTurnLeft.set(false);
+    ledTurnRight.set(false);
   }
 }
 
-/**
- * Alarm handling (blink LEDs and beep periodically)
- */
+// ======================= ALARM / HORN =======================
 void setAlarm(bool state) {
   alarmOn = state;
-  if (!state) {
-    noTone(BUZZER_PIN);
-  }
+  if (!state) noTone(BUZZER_PIN);
 }
 
 void updateAlarm() {
-  if (!alarmOn || hornPlaying) return; // pause alarm sound while horn plays
+  if (!alarmOn || hornPlaying) return;
   unsigned long now = millis();
   if (now - lastAlarmMillis >= ALARM_BLINK_INTERVAL) {
     lastAlarmMillis = now;
-    // Blink headlights and both turn signals
-    static bool alarmBlinkState = false;
-    alarmBlinkState = !alarmBlinkState;
-    digitalWrite(LED_HEADLIGHTS, alarmBlinkState ? HIGH : LOW);
-    digitalWrite(LED_TURN_LEFT, alarmBlinkState ? HIGH : LOW);
-    digitalWrite(LED_TURN_RIGHT, alarmBlinkState ? HIGH : LOW);
+    static bool alarmBlink = false;
+    alarmBlink = !alarmBlink;
+    ledHeadlights.set(alarmBlink);
+    ledTurnLeft.set(alarmBlink);
+    ledTurnRight.set(alarmBlink);
   }
-  // Periodic short beep
-  static unsigned long lastBeepMillis = 0;
-  if (now - lastBeepMillis >= ALARM_BEEP_INTERVAL) {
-    lastBeepMillis = now;
-    tone(BUZZER_PIN, 1200, 120); // non-blocking short beep
+  if (now - lastAlarmBeepMillis >= ALARM_BEEP_INTERVAL) {
+    lastAlarmBeepMillis = now;
+    tone(BUZZER_PIN, 1200, 120);
   }
 }
 
-// Buzzer support removed: playTone deleted
-
-// ============================================
-// HORN (MELODY) IMPLEMENTATION
-// ============================================
-// Simple melody frequencies (Hz) and durations (ms)
-const uint16_t HORN_NOTES[]     = { 523, 392, 330, 262, 392, 523 }; // C5 G4 E4 C4 G4 C5
-const uint16_t HORN_DURATIONS[] = { 160, 160, 200, 260, 180, 300 };
-const size_t HORN_LENGTH = sizeof(HORN_NOTES)/sizeof(HORN_NOTES[0]);
-
 void startHorn() {
-  if (hornPlaying) return; // already playing
+  if (hornPlaying) return;
   hornPlaying = true;
   hornIndex = 0;
   hornNoteStartMillis = millis();
@@ -741,7 +615,7 @@ void startHorn() {
 void updateHorn() {
   if (!hornPlaying) return;
   unsigned long now = millis();
-  if (now - hornNoteStartMillis >= (unsigned long)HORN_DURATIONS[hornIndex] + 40) { // 40ms gap
+  if (now - hornNoteStartMillis >= (unsigned long)HORN_DURATIONS[hornIndex] + 40) {
     hornIndex++;
     if (hornIndex >= HORN_LENGTH) {
       hornPlaying = false;
@@ -753,121 +627,450 @@ void updateHorn() {
   }
 }
 
-// ============================================
-// BLUETOOTH HANDLING
-// ============================================
-
+// ======================= INPUT HANDLING =======================
+// Bluetooth line parser (input-only)
 void handleBluetoothInput() {
   while (BTSerial.available() > 0) {
     char c = (char)BTSerial.read();
-    Serial.print("BT Received: ");
-    Serial.println(c);
-    processBTCommand(c);
+    if (c == '\r') continue;
+    if (c == '\n' || btCmdPos + 1 >= CMD_BUF_SIZE) {
+      btCmdBuf[btCmdPos] = '\0';
+      if (btCmdPos > 0) {
+        processCommandLine(btCmdBuf);
+      }
+      btCmdPos = 0;
+    } else {
+      btCmdBuf[btCmdPos++] = c;
+    }
   }
 }
 
-void processBTCommand(char c) {
-  // Check for lowercase commands before converting to uppercase
-  if (c == 'u') {
-    setHeadlights(false);  // u = headlights OFF
-    return;
-  } else if (c == 'v') {
-    setParkingLights(false);  // v = parking lights OFF
-    return;
-  } else if (c == 'w') {
-    setParkingMode(false);  // w = parking mode OFF
-    return;
-  } else if (c == 'x') {
-    setHazard(false);       // x = hazard OFF
-    return;
-  } else if (c == 'z') {
-    setAlarm(false);        // z = alarm OFF
-    return;
+// Serial line parser (commands & calibration measurements / control)
+void handleSerialInput() {
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    if (c == '\r') continue;
+    if (c == '\n' || serCmdPos + 1 >= CMD_BUF_SIZE) {
+      serCmdBuf[serCmdPos] = '\0';
+      if (serCmdPos > 0) {
+        processCommandLine(serCmdBuf);
+      }
+      serCmdPos = 0;
+    } else {
+      serCmdBuf[serCmdPos++] = c;
+    }
   }
-  
-  c = toupper(c);
+}
+
+// Single-char compatibility (from Serial keyboard or other)
+void processSingleCharCommand(char c) {
+  if (c == 'u') { setHeadlights(false); return; }
+  if (c == 'v') { setParkingLights(false); return; }
+  if (c == 'w') { setParkingMode(false); return; }
+  if (c == 'x') { setHazard(false); return; }
+  if (c == 'z') { setAlarm(false); return; }
+
+  c = toupper(static_cast<unsigned char>(c));
   switch (c) {
-    case 'F':
-      if (systemEnabled && !parkingModeOn) motorForward(currentSpeed);
-      setReverseIndicator(false);
-      break;
-    case 'B':
-      if (systemEnabled && !parkingModeOn) motorBackward(currentSpeed);
-      setReverseIndicator(true);
-      break;
-    case 'L':
-      if (systemEnabled && !parkingModeOn) motorTurnLeft(currentSpeed);
-      setLeftTurn(true); setRightTurn(false);
-      setReverseIndicator(false);
-      break;
-    case 'R':
-      if (systemEnabled && !parkingModeOn) motorTurnRight(currentSpeed);
-      setLeftTurn(false); setRightTurn(true);
-      setReverseIndicator(false);
-      break;
-    case 'G':
-      if (systemEnabled && !parkingModeOn) motorForwardLeft(currentSpeed);
-      setLeftTurn(true); setRightTurn(false);
-      setReverseIndicator(false);
-      break;
-    case 'H':
-      if (systemEnabled && !parkingModeOn) motorForwardRight(currentSpeed);
-      setLeftTurn(false); setRightTurn(true);
-      setReverseIndicator(false);
-      break;
-    case 'I':
-      if (systemEnabled && !parkingModeOn) motorBackwardLeft(currentSpeed);
-      setLeftTurn(true); setRightTurn(false);
-      setReverseIndicator(true);
-      break;
-    case 'J':
-      if (systemEnabled && !parkingModeOn) motorBackwardRight(currentSpeed);
-      setLeftTurn(false); setRightTurn(true);
-      setReverseIndicator(true);
-      break;
-    case 'U':
-      setHeadlights(true);  // U = headlights ON
-      break;
-    case 'V':
-      setParkingLights(true);  // V = parking lights ON
-      break;
-    case 'X':
-      setHazard(true);       // X = hazard ON
-      break;
-    case 'Z':
-      setAlarm(!alarmOn);    // Z = toggle alarm
-      break;
-    case 'Y':
-      startHorn();           // Y = play horn melody once
-      break;
-    case 'W':
-      setParkingMode(true);  // W = parking mode ON
-      setReverseIndicator(false);
-      break;
-    case 'S':
-      if (!parkingModeOn) motorStop();
-      setLeftTurn(false); setRightTurn(false);
-      setReverseIndicator(false);
-      break;
+    case 'F': if (systemEnabled && !parkingModeOn) forward(currentSpeed); break;
+    case 'B': if (systemEnabled && !parkingModeOn) backward(currentSpeed); break;
+    case 'L': if (systemEnabled && !parkingModeOn) turnLeft(currentSpeed); break;
+    case 'R': if (systemEnabled && !parkingModeOn) turnRight(currentSpeed); break;
+    case 'G': if (systemEnabled && !parkingModeOn) forwardLeft(currentSpeed); break;
+    case 'H': if (systemEnabled && !parkingModeOn) forwardRight(currentSpeed); break;
+    case 'I': if (systemEnabled && !parkingModeOn) backwardLeft(currentSpeed); break;
+    case 'J': if (systemEnabled && !parkingModeOn) backwardRight(currentSpeed); break;
+    case 'U': setHeadlights(true); break;
+    case 'V': setParkingLights(true); break;
+    case 'X': setHazard(true); break;
+    case 'Z': setAlarm(!alarmOn); break;
+    case 'Y': startHorn(); break;
+    case 'W': setParkingMode(true); break;
+    case 'S': if (!parkingModeOn) stopMotors(); setLeftTurn(false); setRightTurn(false); break;
     case 'E':
       systemEnabled = !systemEnabled;
-      if (!systemEnabled) motorStop();
+      if (!systemEnabled) stopMotors();
       if (!systemEnabled) setReverseIndicator(false);
-      BTSerial.print("EN:"); BTSerial.println(systemEnabled ? 1 : 0);
-      Serial.print("EN:"); Serial.println(systemEnabled ? 1 : 0);
+      Serial.print(F("EN:")); Serial.println(systemEnabled ? 1 : 0);
       break;
     case 'Q':
-      BTSerial.print("SPD:"); BTSerial.print(currentSpeed);
-      BTSerial.print(" EN:"); BTSerial.println(systemEnabled ? 1 : 0);
+      printStatus();
       break;
     default:
-      // digits 0-9 for speed
       if (c >= '0' && c <= '9') {
         int level = c - '0';
         int newSpeed = map(level, 0, 9, 0, MOTOR_SPEED_MAX);
         currentSpeed = newSpeed;
-        BTSerial.print("SPD:"); BTSerial.println(currentSpeed);
+        Serial.print(F("SPD:")); Serial.println(currentSpeed);
       }
       break;
   }
+}
+
+// ======================= COMMAND LINE PROCESSING =======================
+void processCommandLine(const char *line) {
+  if (!line || *line == '\0') return;
+  if (DEBUG) {
+    Serial.print(F("CMD> "));
+    Serial.println(line);
+  }
+
+  // If calibration expects a numeric measurement, handle that first:
+  if (calPhase == CAL_WAIT_BOTH_MEASURE || calPhase == CAL_WAIT_LEFT_MEASURE || calPhase == CAL_WAIT_RIGHT_MEASURE) {
+    float val = atof(line);
+    if (val <= 0.0f) {
+      Serial.println(F("Invalid measurement. Enter positive number (cm)."));
+      return;
+    }
+    if (calPhase == CAL_WAIT_BOTH_MEASURE) {
+      measuredBoth = val;
+      Serial.print(F("Measured BOTH distance = ")); Serial.print(measuredBoth); Serial.println(F(" cm"));
+      calPhase = CAL_WAIT_LEFT_RUN;
+      Serial.println(F("Now trigger left-only run from Bluetooth or Serial by sending: CAL_RUN L"));
+      return;
+    } else if (calPhase == CAL_WAIT_LEFT_MEASURE) {
+      measuredLeft = val;
+      Serial.print(F("Measured LEFT distance = ")); Serial.print(measuredLeft); Serial.println(F(" cm"));
+      calPhase = CAL_WAIT_RIGHT_RUN;
+      Serial.println(F("Now trigger right-only run from Bluetooth or Serial by sending: CAL_RUN R"));
+      return;
+    } else if (calPhase == CAL_WAIT_RIGHT_MEASURE) {
+      measuredRight = val;
+      Serial.print(F("Measured RIGHT distance = ")); Serial.print(measuredRight); Serial.println(F(" cm"));
+      calApplyAndCompute();
+      return;
+    }
+  }
+
+  // tokenize line
+  char buf[CMD_BUF_SIZE];
+  strncpy(buf, line, CMD_BUF_SIZE);
+  buf[CMD_BUF_SIZE - 1] = '\0';
+  char *saveptr = nullptr;
+  char *tok = strtok_r(buf, " ", &saveptr);
+  if (!tok) return;
+
+  // HELP
+  if (strcasecmp(tok, "HELP") == 0 || strcmp(tok, "?") == 0) {
+    printStartupHelp();
+    return;
+  }
+
+  // RESET CAL command (factory restore)
+  if (strcasecmp(tok, "RESET") == 0) {
+    char *sub = strtok_r(NULL, " ", &saveptr);
+    if (sub && (strcasecmp(sub, "CAL") == 0 || strcasecmp(sub, "CAL\n") == 0)) {
+      resetCalibrationToFactory();
+      return;
+    } else {
+      Serial.println(F("Usage: RESET CAL  (restores factory calibration and saves to EEPROM)"));
+      return;
+    }
+  }
+
+  // top-level commands
+  if (strcasecmp(tok, "CAL?") == 0) {
+    Serial.println(F("Calibration (RAM):"));
+    Serial.print(F("  LF=")); Serial.println(motorLeft.forwardCoef);
+    Serial.print(F("  LB=")); Serial.println(motorLeft.backwardCoef);
+    Serial.print(F("  RF=")); Serial.println(motorRight.forwardCoef);
+    Serial.print(F("  RB=")); Serial.println(motorRight.backwardCoef);
+    return;
+  }
+
+  if (strcasecmp(tok, "STATUS") == 0) {
+    printStatus();
+    return;
+  }
+
+  if (strcasecmp(tok, "CAL") == 0) {
+    char *sub = strtok_r(NULL, " ", &saveptr);
+    if (!sub) {
+      Serial.println(F("CAL commands: START F|B <ms> | SAVE | CANCEL | ABORT | L|R F|B <value> | ?"));
+      return;
+    }
+    if (strcasecmp(sub, "START") == 0) {
+      char *dirTok = strtok_r(NULL, " ", &saveptr); // F or B
+      char *durTok = strtok_r(NULL, " ", &saveptr); // duration ms
+      if (!dirTok || !durTok) {
+        Serial.println(F("Usage: CAL START F|B <duration_ms>"));
+        return;
+      }
+      unsigned long dur = strtoul(durTok, NULL, 10);
+      if (strcasecmp(dirTok, "F") == 0) calStart(CAL_FORWARD, dur);
+      else if (strcasecmp(dirTok, "B") == 0) calStart(CAL_BACKWARD, dur);
+      else Serial.println(F("CAL START direction must be F or B"));
+      return;
+    } else if (strcasecmp(sub, "SAVE") == 0) {
+      calSave();
+      return;
+    } else if (strcasecmp(sub, "CANCEL") == 0 || strcasecmp(sub, "ABORT") == 0) {
+      calCancel();
+      return;
+    } else {
+      // manual coefficient set: CAL L F 0.95
+      char *side = sub;
+      char *dir = strtok_r(NULL, " ", &saveptr);
+      char *valTok = strtok_r(NULL, " ", &saveptr);
+      if (!dir || !valTok) {
+        Serial.println(F("CAL usage: CAL L|R F|B <value> OR CAL START ... OR CAL SAVE/CANCEL"));
+        return;
+      }
+      float v = atof(valTok);
+      if (v <= 0.0f) {
+        Serial.println(F("Invalid coefficient value (must be > 0)"));
+        return;
+      }
+      if (strcasecmp(side, "L") == 0) {
+        if (strcasecmp(dir, "F") == 0) motorLeft.forwardCoef = v;
+        else if (strcasecmp(dir, "B") == 0) motorLeft.backwardCoef = v;
+        else { Serial.println(F("Direction must be F or B")); return; }
+      } else if (strcasecmp(side, "R") == 0) {
+        if (strcasecmp(dir, "F") == 0) motorRight.forwardCoef = v;
+        else if (strcasecmp(dir, "B") == 0) motorRight.backwardCoef = v;
+        else { Serial.println(F("Direction must be F or B")); return; }
+      } else {
+        Serial.println(F("Side must be L or R"));
+        return;
+      }
+      Serial.println(F("Calibration updated in RAM. Use CAL SAVE to persist to EEPROM."));
+      return;
+    }
+  }
+
+  // CAL_RUN commands (can arrive via BT or Serial)
+  if (strcasecmp(tok, "CAL_RUN") == 0) {
+    char *which = strtok_r(NULL, " ", &saveptr); // BOTH | L | R
+    if (!which) {
+      Serial.println(F("CAL_RUN usage: CAL_RUN BOTH|L|R (send via BT or Serial to trigger movement)"));
+      return;
+    }
+    if (calPhase == CAL_IDLE) {
+      Serial.println(F("No calibration session active. Start with: CAL START F|B <ms>"));
+      return;
+    }
+    // Trigger the run matching current phase
+    if (strcasecmp(which, "BOTH") == 0) {
+      if (calPhase != CAL_WAIT_BOTH_RUN) {
+        Serial.println(F("Unexpected CAL_RUN BOTH; not in BOTH_RUN phase."));
+        return;
+      }
+      Serial.println(F("Running BOTH motors (raw) for configured duration..."));
+      int s = calTestSpeed;
+      if (calDir == CAL_BACKWARD) s = -s;
+      runMotorsRaw(s, s, calDurationMs);
+      Serial.println(F("Run complete. Enter measured distance (cm) on Serial:"));
+      calPhase = CAL_WAIT_BOTH_MEASURE;
+      return;
+    } else if (strcasecmp(which, "L") == 0) {
+      if (calPhase != CAL_WAIT_LEFT_RUN) {
+        Serial.println(F("Unexpected CAL_RUN L; not in LEFT_RUN phase."));
+        return;
+      }
+      Serial.println(F("Running LEFT motor only (raw) for configured duration..."));
+      int s = calTestSpeed;
+      if (calDir == CAL_BACKWARD) s = -s;
+      runMotorsRaw(s, 0, calDurationMs);
+      Serial.println(F("Run complete. Enter measured distance (cm) on Serial:"));
+      calPhase = CAL_WAIT_LEFT_MEASURE;
+      return;
+    } else if (strcasecmp(which, "R") == 0) {
+      if (calPhase != CAL_WAIT_RIGHT_RUN) {
+        Serial.println(F("Unexpected CAL_RUN R; not in RIGHT_RUN phase."));
+        return;
+      }
+      Serial.println(F("Running RIGHT motor only (raw) for configured duration..."));
+      int s = calTestSpeed;
+      if (calDir == CAL_BACKWARD) s = -s;
+      runMotorsRaw(0, s, calDurationMs);
+      Serial.println(F("Run complete. Enter measured distance (cm) on Serial:"));
+      calPhase = CAL_WAIT_RIGHT_MEASURE;
+      return;
+    } else {
+      Serial.println(F("CAL_RUN argument must be BOTH, L or R"));
+      return;
+    }
+  }
+
+  // If single-char command line like "F" or "S", handle via single-char processor
+  if (strlen(line) == 1) {
+    processSingleCharCommand(line[0]);
+    return;
+  }
+
+  Serial.println(F("Unknown command. Type HELP for usage."));
+}
+
+// ======================= CALIBRATION HELPERS =======================
+void calStart(CalDir dir, unsigned long durationMs) {
+  if (calPhase != CAL_IDLE && calPhase != CAL_APPLIED) {
+    Serial.println(F("Calibration already in progress. Use CAL ABORT to cancel."));
+    return;
+  }
+  // backup current coeffs
+  calBackup.lf = motorLeft.forwardCoef;
+  calBackup.lb = motorLeft.backwardCoef;
+  calBackup.rf = motorRight.forwardCoef;
+  calBackup.rb = motorRight.backwardCoef;
+
+  calDir = dir;
+  calDurationMs = durationMs;
+  calTestSpeed = currentSpeed > 0 ? currentSpeed : 120;
+  measuredBoth = measuredLeft = measuredRight = 0.0f;
+
+  calPhase = CAL_WAIT_BOTH_RUN;
+  Serial.print(F("Calibration started ("));
+  Serial.print(dir == CAL_FORWARD ? F("FORWARD") : F("BACKWARD"));
+  Serial.print(F(", duration_ms=")); Serial.print(calDurationMs);
+  Serial.println(F(")"));
+  Serial.println(F("Trigger BOTH run from Bluetooth or Serial: CAL_RUN BOTH"));
+  Serial.println(F("After run, enter measured distance (cm) on Serial."));
+}
+
+void calAbort() {
+  // revert
+  motorLeft.forwardCoef = calBackup.lf;
+  motorLeft.backwardCoef = calBackup.lb;
+  motorRight.forwardCoef = calBackup.rf;
+  motorRight.backwardCoef = calBackup.rb;
+  calPhase = CAL_IDLE;
+  Serial.println(F("Calibration aborted. Restored previous coefficients."));
+}
+
+void calApplyAndCompute() {
+  if (measuredBoth <= 0.0f || measuredLeft <= 0.0f || measuredRight <= 0.0f) {
+    Serial.println(F("Measurements incomplete or invalid. Cannot compute coefficients."));
+    calPhase = CAL_IDLE;
+    return;
+  }
+  float target = measuredBoth / 2.0f;
+  float factorL = (measuredLeft > 0.0f) ? (target / measuredLeft) : 1.0f;
+  float factorR = (measuredRight > 0.0f) ? (target / measuredRight) : 1.0f;
+  if (!isfinite(factorL) || factorL <= 0.0f) factorL = 1.0f;
+  if (!isfinite(factorR) || factorR <= 0.0f) factorR = 1.0f;
+
+  if (calDir == CAL_FORWARD) {
+    motorLeft.forwardCoef *= factorL;
+    motorRight.forwardCoef *= factorR;
+  } else {
+    motorLeft.backwardCoef *= factorL;
+    motorRight.backwardCoef *= factorR;
+  }
+
+  calPhase = CAL_APPLIED;
+  Serial.println(F("Calibration applied in RAM. New coefficients:"));
+  Serial.print(F("  LF=")); Serial.println(motorLeft.forwardCoef);
+  Serial.print(F("  LB=")); Serial.println(motorLeft.backwardCoef);
+  Serial.print(F("  RF=")); Serial.println(motorRight.forwardCoef);
+  Serial.print(F("  RB=")); Serial.println(motorRight.backwardCoef);
+  Serial.println(F("Test the robot using Bluetooth. If OK, enter on Serial: CAL SAVE"));
+  Serial.println(F("To discard changes and restore previous values enter: CAL CANCEL"));
+}
+
+void calSave() {
+  if (calPhase != CAL_APPLIED) {
+    Serial.println(F("No new calibration to save (use CAL START ... first)."));
+    return;
+  }
+  saveCalibrationToEEPROM();
+  calPhase = CAL_IDLE;
+  Serial.println(F("Calibration saved to EEPROM."));
+}
+
+void calCancel() {
+  motorLeft.forwardCoef = calBackup.lf;
+  motorLeft.backwardCoef = calBackup.lb;
+  motorRight.forwardCoef = calBackup.rf;
+  motorRight.backwardCoef = calBackup.rb;
+  calPhase = CAL_IDLE;
+  Serial.println(F("Calibration canceled. Restored saved coefficients."));
+}
+
+// ======================= UTIL =======================
+void blinkLED(const LED &l, int times, int delayMs) {
+  for (int i = 0; i < times; ++i) {
+    l.set(true); delay(delayMs);
+    l.set(false); delay(delayMs);
+  }
+}
+
+void dbgPrint(const char *label, const String &value) {
+  if (!DEBUG) return;
+  Serial.print(label); Serial.print(F(": ")); Serial.println(value);
+}
+
+void printStatus() {
+  Serial.println(F("STATUS:"));
+  Serial.print(F("  SPD: ")); Serial.println(currentSpeed);
+  Serial.print(F("  ENABLED: ")); Serial.println(systemEnabled ? F("1") : F("0"));
+  Serial.print(F("  HEADLIGHTS: ")); Serial.println(headlightsOn ? F("ON") : F("OFF"));
+  Serial.print(F("  PARKING MODE: ")); Serial.println(parkingModeOn ? F("ON") : F("OFF"));
+  Serial.println(F("  Calibration:"));
+  Serial.print(F("    LF=")); Serial.println(motorLeft.forwardCoef);
+  Serial.print(F("    LB=")); Serial.println(motorLeft.backwardCoef);
+  Serial.print(F("    RF=")); Serial.println(motorRight.forwardCoef);
+  Serial.print(F("    RB=")); Serial.println(motorRight.backwardCoef);
+  Serial.print(F("  CAL Phase: "));
+  switch (calPhase) {
+    case CAL_IDLE: Serial.println(F("IDLE")); break;
+    case CAL_WAIT_BOTH_RUN: Serial.println(F("WAIT_BOTH_RUN")); break;
+    case CAL_WAIT_BOTH_MEASURE: Serial.println(F("WAIT_BOTH_MEASURE")); break;
+    case CAL_WAIT_LEFT_RUN: Serial.println(F("WAIT_LEFT_RUN")); break;
+    case CAL_WAIT_LEFT_MEASURE: Serial.println(F("WAIT_LEFT_MEASURE")); break;
+    case CAL_WAIT_RIGHT_RUN: Serial.println(F("WAIT_RIGHT_RUN")); break;
+    case CAL_WAIT_RIGHT_MEASURE: Serial.println(F("WAIT_RIGHT_MEASURE")); break;
+    case CAL_APPLIED: Serial.println(F("APPLIED (await SAVE/CANCEL)")); break;
+    default: Serial.println(F("UNKNOWN")); break;
+  }
+}
+
+void printStartupHelp() {
+  Serial.println(F(""));
+  Serial.println(F("=== Car Robot - Quick Help ==="));
+  Serial.println(F("Input via Bluetooth (BT) or Serial. Output only to Serial (monitor)."));
+  Serial.println(F("Basic single-char commands (send via BT or Serial):"));
+  Serial.println(F("  F - forward, B - back, L - turn left, R - turn right, S - stop"));
+  Serial.println(F("  0..9 - set speed level (mapped to PWM)"));
+  Serial.println(F("Calibration commands (interactive):"));
+  Serial.println(F("  CAL?                 - show current calibration (RAM)"));
+  Serial.println(F("  CAL START F|B <ms>   - start interactive calibration for FORWARD/BACKWARD"));
+  Serial.println(F("  CAL_RUN BOTH|L|R     - trigger movement run (send via BT or Serial)"));
+  Serial.println(F("  After a run completes, measure distance (cm) externally and type number in Serial."));
+  Serial.println(F("  CAL SAVE             - save applied calibration to EEPROM"));
+  Serial.println(F("  CAL CANCEL           - cancel calibration (restore previous values)"));
+  Serial.println(F("  CAL L F|B <value>    - set coefficient manually in RAM"));
+  Serial.println(F("Factory restore:"));
+  Serial.println(F("  RESET CAL            - restore built-in factory calibration and save to EEPROM"));
+  Serial.println(F("Utilities:"));
+  Serial.println(F("  STATUS               - print status and current calibration"));
+  Serial.println(F("  HELP or ?            - print this help"));
+  Serial.println(F("=============================="));
+  Serial.println(F(""));
+}
+
+void playWindowsStartup() {
+  // Play Windows XP-style startup sound (blocking)
+  for (size_t i = 0; i < WIN_STARTUP_LENGTH; i++) {
+    tone(BUZZER_PIN, WIN_STARTUP_NOTES[i], WIN_STARTUP_DURATIONS[i]);
+    delay(WIN_STARTUP_DURATIONS[i] ); // small gap between notes
+  }
+  noTone(BUZZER_PIN);
+  delay(100); // brief pause after melody
+}
+
+// ======================= MAIN LOOP =======================
+void loop() {
+  unsigned long now = millis();
+
+  // handle inputs
+  handleBluetoothInput();
+  handleSerialInput();
+
+  // update state machines
+  updateBrakeLight();
+  updateTurnSignals();
+  updateAlarm();
+  updateHorn();
+
+  delay(LOOP_DELAY);
 }
